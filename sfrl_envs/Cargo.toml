@@ -1,0 +1,14 @@
+[package]
+name = "sfrl_envs"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "sfrl_envs"
+path = "src/lib.rs"
+
+[dependencies]
+sfrl_core = { path = "../sfrl_core" }
+sfrl_engines = { path = "../sfrl_engines" }
+rand = { workspace = true }
+rand_distr = { workspace = true }

@@ -1,0 +1,14 @@
+[package]
+name = "sfrl_runner"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sfrl_core = { path = "../sfrl_core" }
+sfrl_envs = { path = "../sfrl_envs" }
+sfrl_algorithms = { path = "../sfrl_algorithms" }
+rand = { workspace = true }
+
+[[bin]]
+name = "sfrl_runner"
+path = "src/main.rs"
