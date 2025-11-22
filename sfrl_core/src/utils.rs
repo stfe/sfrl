@@ -1,4 +1,6 @@
+use crate::{Action, Actions, HasActorId};
 use std::cmp::Ordering::Less;
+use std::f32::consts::PI;
 
 pub fn argmax(data: &[f32]) -> usize {
     data.iter()
@@ -12,17 +14,26 @@ pub fn softmax(logits: &[f32]) -> Vec<f32> {
     if logits.is_empty() {
         return Vec::new();
     }
-
-    let max_logit = logits
-        .iter()
-        .fold(f32::NEG_INFINITY, |a, &b| f32::max(a, b));
-
+    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut exponents: Vec<f32> = logits.iter().map(|&l| (l - max_logit).exp()).collect();
     let sum_exponents: f32 = exponents.iter().sum();
     if sum_exponents == 0.0 {
         return vec![0.0; logits.len()];
     }
     exponents.into_iter().map(|p| p / sum_exponents).collect()
+}
+
+pub fn log_softmax(logits: &[f32]) -> Vec<f32> {
+    if logits.is_empty() {
+        return Vec::new();
+    }
+    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let sum_exp = logits.iter().map(|&l| (l - max_logit).exp()).sum::<f32>();
+    if sum_exp == 0.0 || !sum_exp.is_finite() {
+        return vec![f32::NEG_INFINITY; logits.len()];
+    }
+    let log_sum_exp = sum_exp.ln() + max_logit; // Final log(sum(exp(z_j)))
+    logits.iter().map(|&l| l - log_sum_exp).collect()
 }
 
 pub fn categorical_sample(logits: &[f32], rng: &impl Fn() -> f32) -> usize {
@@ -43,4 +54,72 @@ pub fn gaussian_sample(mean: f32, log_sigma: f32, rng: &impl Fn() -> f32) -> f32
     let noise = rng() * 2.0 - 1.0; // rng should be normally distributed mean 0 and std 1
     let sample = mean + sigma * noise;
     sample
+}
+
+pub fn gaussian_log_prob(mean: f32, log_sigma: f32, value: f32) -> f32 {
+    let sigma = log_sigma.exp();
+    let variance = sigma * sigma;
+    let diff = value - mean;
+    -0.5 * (diff * diff / variance + (2.0 * PI * variance).ln())
+}
+
+pub fn discrete_log_prob(logits: &[f32], value: u32) -> f32 {
+    let probs = softmax(logits);
+    let chosen_prob = probs[value as usize];
+    if chosen_prob > 0.0 {
+        chosen_prob.ln()
+    } else {
+        f32::NEG_INFINITY
+    }
+}
+
+pub fn calculate_log_probs(logits: &[f32], actions: &Actions) -> f32 {
+    if actions.is_empty() {
+        panic!("Incorrect state. Actions cannot be empty.")
+    }
+    let actor_id = actions[0].actor_id();
+    let mut logit_start = 0;
+    let mut total_log_prob = 0_f32;
+    for action in actions {
+        match action {
+            &Action::Continuous {
+                actor_id: id,
+                value,
+                min: _,
+                max: _,
+                num_of_logits,
+            } => {
+                if id != actor_id {
+                    panic!(
+                        "Incorrect state. Actor IDs do not match. All actions should belong to one agent."
+                    )
+                } else if num_of_logits != 2 {
+                    // TODO fix magic number
+                    panic! {
+                        "Incorrect state. Number of logits must be 2"
+                    }
+                }
+                let logit_end = logit_start + num_of_logits;
+                let action_logits = &logits[logit_start..logit_end];
+                total_log_prob += gaussian_log_prob(action_logits[0], action_logits[1], value);
+                logit_start = logit_end;
+            }
+            &Action::Discrete {
+                actor_id: id,
+                value,
+                num_of_logits,
+            } => {
+                if id != actor_id {
+                    panic!(
+                        "Incorrect state. Actor IDs do not match. All actions should belong to one agent."
+                    )
+                }
+                let logit_end = logit_start + num_of_logits;
+                let action_logits = &logits[logit_start..logit_end];
+                total_log_prob += discrete_log_prob(action_logits, value);
+                logit_start = logit_end;
+            }
+        }
+    }
+    total_log_prob
 }

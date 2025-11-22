@@ -12,3 +12,4 @@ sfrl_core = { path = "../sfrl_core" }
 sfrl_engines = { path = "../sfrl_engines" }
 rand = { workspace = true }
 rand_distr = { workspace = true }
+burn = { workspace = true }

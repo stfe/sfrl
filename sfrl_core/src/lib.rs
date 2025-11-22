@@ -1,4 +1,5 @@
 pub mod utils;
+pub mod algorithms;
 
 pub trait HasActorId {
     fn actor_id(&self) -> ActorId;
@@ -6,8 +7,18 @@ pub trait HasActorId {
 
 #[derive(Clone, Debug)]
 pub enum Action {
-    Continuous { actor_id: ActorId, value: f32 },
-    Discrete { actor_id: ActorId, value: u32 },
+    Continuous {
+        actor_id: ActorId,
+        value: f32,
+        min: f32,
+        max: f32,
+        num_of_logits: usize,
+    },
+    Discrete {
+        actor_id: ActorId,
+        value: u32,
+        num_of_logits: usize,
+    },
 }
 
 impl HasActorId for Action {

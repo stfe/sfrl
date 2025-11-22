@@ -6,3 +6,6 @@ edition = "2024"
 [lib]
 name = "sfrl_engines"
 path = "src/lib.rs"
+
+[dependencies]
+burn = { workspace = true }

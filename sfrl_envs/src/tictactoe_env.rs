@@ -64,12 +64,14 @@ impl Env for TicTacToeEnv {
                 return vec![Action::Discrete {
                     actor_id,
                     value: index as u32,
+                    num_of_logits: 9,
                 }];
             }
         }
         vec![Action::Discrete {
             actor_id,
             value: logits.len() as u32 - 1,
+            num_of_logits: 9,
         }]
     }
 
@@ -80,6 +82,7 @@ impl Env for TicTacToeEnv {
             Action::Discrete {
                 actor_id: _,
                 value: index,
+                num_of_logits: _,
             } => {
                 if !self.game.place(index as usize) {
                     panic!("Incorrect action position");

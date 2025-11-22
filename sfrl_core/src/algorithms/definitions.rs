@@ -1,4 +1,4 @@
-use sfrl_core::{Actions, Env, Observation, Observations, StepResults};
+use crate::{Actions, Env, Observation, Observations, StepResults};
 
 pub type ActionLogits = Vec<f32>;
 pub type ValueLogit = f32;

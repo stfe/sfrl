@@ -1,5 +1,6 @@
-use crate::definitions::{Agent, Algorithm, LogProb, Model, ValueLogit};
-use sfrl_core::{Actions, Env, HasActorId, Observation, Observations, StepResult, StepResults};
+use super::definitions::{Agent, Algorithm, LogProb, Model, ValueLogit};
+use crate::utils::calculate_log_probs;
+use crate::{Actions, ActorId, Env, HasActorId, Observation, Observations, StepResult, StepResults};
 
 #[derive(Clone, Debug)]
 struct TrajectoryPoint {
@@ -23,8 +24,17 @@ impl Trajectory {
         Self { paths }
     }
 
-    fn add_point(&mut self, observations: Observations, actions: Actions, results: StepResults) {
+    fn add_point(
+        &mut self,
+        observations: Observations,
+        actions: Actions,
+        log_probs: Vec<(ActorId, LogProb)>,
+        values: Vec<(ActorId, ValueLogit)>,
+        results: StepResults,
+    ) {
         let mut acts = vec![Actions::default(); self.paths.len()];
+        let mut lp = vec![LogProb::default(); self.paths.len()];
+        let mut vs = vec![ValueLogit::default(); self.paths.len()];
         let mut obs = vec![Observation::default(); self.paths.len()];
         let mut ress = vec![StepResult::default(); self.paths.len()];
         for Observation { actor_id, data } in observations {
@@ -44,12 +54,26 @@ impl Trajectory {
             ress[actor_id].done = done;
         }
         for action in actions {
-            let index = action.actor_id();
-            acts[index].push(action);
+            let actor_id = action.actor_id();
+            acts[actor_id].push(action);
         }
+
+        log_probs
+            .into_iter()
+            .for_each(|(actor_id, log_prob)| lp[actor_id] = log_prob);
+
+        values
+            .into_iter()
+            .for_each(|(actor_id, value)| vs[actor_id] = value);
+
         for i in 0..self.paths.len() {
-            let (actions, observation, result) =
-                (acts.pop().unwrap(), obs.pop().unwrap(), ress.pop().unwrap());
+            let (actions, observation, result, value, log_prob) = (
+                acts.pop().unwrap(),
+                obs.pop().unwrap(),
+                ress.pop().unwrap(),
+                vs.pop().unwrap(),
+                lp.pop().unwrap(),
+            );
             if actions.is_empty() {
                 continue;
             }
@@ -57,8 +81,8 @@ impl Trajectory {
                 observation,
                 actions,
                 result,
-                value: 0.0,    // TODO pass this parameter for training
-                log_prob: 0.0, // TODO pass this parameter for training
+                value,
+                log_prob,
             });
         }
     }
@@ -108,20 +132,30 @@ impl Algorithm for Ppo {
         agent: &mut dyn Agent,
     ) {
         env.reset();
-        for t in 0..steps {
+        for _t in 0..steps {
             let mut trajectory = Trajectory::new(env.number_of_actors());
             let observations = env.observations();
             let mut actions = Actions::default();
-            for observation in observations {
+            let mut values: Vec<(ActorId, ValueLogit)> = Vec::with_capacity(observations.len());
+            let mut log_probs: Vec<(ActorId, ValueLogit)> = Vec::with_capacity(observations.len());
+
+            for observation in &observations {
                 let (action_logits, value_logit) = model.infer(&observation);
-                actions.append(
-                    &mut env.sample_from_model_output(observation.actor_id, &action_logits),
-                );
+                values.push((observation.actor_id, value_logit));
+                let mut single_actor_actions =
+                    env.sample_from_model_output(observation.actor_id, &action_logits);
+                log_probs.push((
+                    observation.actor_id,
+                    calculate_log_probs(&action_logits, &actions),
+                ));
+                actions.append(&mut single_actor_actions);
             }
             let res = agent.step(env, &actions);
+            let done = res.is_done();
+            trajectory.add_point(observations, actions, log_probs, values, res);
 
             // TODO implement logic if trajectory limit achieved
-            if res.is_done() {
+            if done {
                 // TODO convert trajectory to experiences
 
                 env.reset();

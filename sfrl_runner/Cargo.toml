@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 sfrl_core = { path = "../sfrl_core" }
 sfrl_envs = { path = "../sfrl_envs" }
-sfrl_algorithms = { path = "../sfrl_algorithms" }
 rand = { workspace = true }
+burn = { workspace = true }
 
 [[bin]]
 name = "sfrl_runner"
