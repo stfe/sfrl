@@ -54,7 +54,7 @@ impl Env for TicTacToeEnv {
         self.game_to_observations()
     }
 
-    fn sample_from_model_output(&mut self, actor_id: ActorId, logits: &[f32]) -> Actions {
+    fn sample(&mut self, actor_id: ActorId, logits: &[f32]) -> Actions {
         let rng_value: f32 = self.rng.sample(StandardNormal);
         let probs = softmax(logits);
         let mut acc_prob = 0.0;
