@@ -1,4 +1,7 @@
-use crate::defs::{Action, ActorId, Environment, Model, ModelManager, Observation, StepResult};
+use crate::defs::{
+    Action, ActionSpace, ActorId, Environment, Model, ModelId, ModelManager, Observation,
+    StepResult,
+};
 use burn::nn::{Linear, LinearConfig, Relu};
 use burn::optim::Adam;
 use burn::prelude::*;
@@ -7,7 +10,7 @@ use burn::tensor::backend::AutodiffBackend;
 use rand::distr::weighted::WeightedIndex;
 use rand::distr::Distribution;
 use rand::rngs::ThreadRng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
 #[derive(Config)]
@@ -19,6 +22,7 @@ pub struct PPOConfig {
     pub entropy_coef: f64, // Weight for entropy bonus (0.01)
     pub learning_rate: f64,
     pub batch_size: usize,
+    pub max_steps: usize,
     pub epochs_per_rollout: usize,
 }
 
@@ -27,6 +31,15 @@ struct PPOModelLogits<B: Backend> {
     continuous_mean: Tensor<B, 2>,
     continuous_log_std: Tensor<B, 2>,
     values: Tensor<B, 2>, // TODO add validation to values size
+}
+
+struct TrainingData<B: Backend> {
+    obs: Tensor<B, 2>,
+    discrete_actions: Tensor<B, 2>,
+    continuous_actions: Tensor<B, 2>,
+    log_probs: Tensor<B, 2>,
+    advantages: Tensor<B, 2>,
+    returns: Tensor<B, 2>,
 }
 
 pub trait PPOModel<B: Backend>: Model {
@@ -156,13 +169,13 @@ where
     /// Main entry point. Runs one full PPO iteration (Rollout -> GAE -> Update).
     pub fn train_step(&mut self, env: &mut dyn Environment) {
         // 1. Vectorized Data Collection
-        let buffer = self.collect_trajectory(env);
+        let trajectory = self.collect_trajectory(env);
 
         // 2. Generalized Advantage Estimation (GAE)
-        let (advantages, returns) = self.compute_gae(&buffer);
+        let training_data = self.build_training_data(env, &trajectory);
 
         // 3. Policy & Value Update
-        self.update_policy(buffer, advantages, returns);
+        self.update_policy(trajectory, advantages, returns);
     }
 
     fn collect_trajectory(&mut self, env: &mut dyn Environment) -> Trajectory {
@@ -188,20 +201,10 @@ where
                 let inference_result = model.forward(obs_tensor);
                 actions.extend(self.sample(env, inference_result, &obs, &mut trajectory));
             }
-
-            // C. Action Sampling & Step
-
-            // D. Handle Next Step. Step is done when all actions are sampled for each ActorId
             let step_result = env.step(actions);
-
-            // E. Store Rewards/Dones and update current observations
             self.process_step_result(&step_result, &mut trajectory);
-
-            // For PPO, if an actor is done, we usually reset it immediately or the env handles it.
-            // Here we assume `step_result.observations` contains the *new* state (reset or next).
             obs_map = step_result.observations;
         }
-
         trajectory
     }
 
@@ -297,75 +300,170 @@ where
             }
         }
 
-        // Prepare Actions HashMap for the Environment
-        let mut actions_map = HashMap::new();
-        // TODO fill out action map from Trajectory
-
-        actions_map
+        let mut actions = HashMap::new();
+        for (actor_id, _) in obs {
+            let tr = trajectory.get_last_mut(*actor_id).unwrap();
+            actions.insert(*actor_id, tr.action.clone());
+        }
+        actions
     }
 
-    /// Helper: Processes StepResult to store rewards and done flags
-    fn process_step_result(&self, result: &StepResult, buffer: &mut RolloutBuffer) {
-        for &id in &self.sorted_actor_ids {
-            let r = *result.rewards.get(&id).unwrap_or(&0.0);
-            let term = *result.terminated.get(&id).unwrap_or(&false);
-            let trunc = *result.truncated.get(&id).unwrap_or(&false);
-
-            buffer.rewards.push(r);
-            buffer.dones.push(if term || trunc { 1.0 } else { 0.0 });
+    fn process_step_result(&self, result: &StepResult, trajectory: &mut Trajectory) {
+        for (actor_id, r) in result.rewards.iter() {
+            let term = *result.terminated.get(&actor_id).unwrap_or(&false);
+            let trunc = *result.truncated.get(&actor_id).unwrap_or(&false);
+            let tr = trajectory.get_last_mut(*actor_id).unwrap();
+            tr.reward = *r;
+            tr.done = if term || trunc { 1.0 } else { 0.0 };
         }
     }
 
     // -------------------------------------------------------------------------
-    // Phase 2: GAE Calculation
+    // Phase 2: Preparing training data for Neural Network Models
     // -------------------------------------------------------------------------
 
-    fn compute_gae(&self, buffer: &RolloutBuffer) -> (Tensor<B, 2>, Tensor<B, 2>) {
-        let total_steps = buffer.num_steps;
-        let num_actors = buffer.num_actors;
-        let len = total_steps * num_actors;
+    fn build_training_data(
+        &self,
+        env: &dyn Environment,
+        trajectory: &Trajectory, // TODO support multiple trajectories
+    ) -> HashMap<ModelId, TrainingData<B>> {
+        let mut all_advantages: HashMap<ModelId, Vec<f32>> = HashMap::new();
+        let mut all_returns: HashMap<ModelId, Vec<f32>> = HashMap::new();
+        let mut all_observations_flat: HashMap<ModelId, Vec<f32>> = HashMap::new();
+        let mut all_discrete_actions_flat: HashMap<ModelId, Vec<u32>> = HashMap::new();
+        let mut all_continuous_actions_flat: HashMap<ModelId, Vec<f32>> = HashMap::new();
+        let mut all_log_probs: HashMap<ModelId, Vec<f32>> = HashMap::new();
+        let mut all_action_spaces: HashMap<ModelId, ActionSpace> = HashMap::new();
 
-        let mut advantages = vec![0.0; len];
-        let mut returns = vec![0.0; len];
-
-        // We compute GAE per actor column
-        // Data is stored row-major: [Step 0 (All Actors), Step 1 (All Actors)...]
-        // Index = step * num_actors + actor_idx
-
-        for actor_idx in 0..num_actors {
+        for (actor_id, points) in trajectory.paths.iter() {
+            let model_id = env.model_id(*actor_id);
             let mut gae = 0.0;
-            let mut next_value = 0.0; // Value of state beyond the horizon (approx 0 or bootstrap)
+            let mut next_value = 0.0; // Bootstrap value (0.0 if done)
 
-            for step in (0..total_steps).rev() {
-                let idx = step * num_actors + actor_idx;
+            let mut actor_advantages = vec![0.0; points.len()];
+            let mut actor_returns = vec![0.0; points.len()];
 
-                let reward = buffer.rewards[idx];
-                let value = buffer.values[idx];
-                let done = buffer.dones[idx];
+            for t in (0..points.len()).rev() {
+                // iterate backwards
+                let point = &points[t];
 
-                // If done, next_value is irrelevant (masked by 1 - done)
-                let mask = 1.0 - done;
+                // If done=1.0, we mask out the next_value
+                let mask = 1.0 - point.done;
 
-                let delta = reward + (self.config.gamma as f32 * next_value * mask) - value;
+                let delta =
+                    point.reward + (self.config.gamma as f32 * next_value * mask) - point.value;
                 gae =
                     delta + (self.config.gamma as f32 * self.config.gae_lambda as f32 * mask * gae);
 
-                advantages[idx] = gae;
-                returns[idx] = gae + value;
+                actor_advantages[t] = gae;
+                actor_returns[t] = gae + point.value;
 
-                next_value = value;
+                next_value = point.value;
             }
+
+            all_advantages
+                .entry(model_id)
+                .or_insert(vec![])
+                .extend(actor_advantages);
+            all_returns
+                .entry(model_id)
+                .or_insert(vec![])
+                .extend(actor_returns);
+            all_observations_flat
+                .entry(model_id)
+                .or_insert(vec![])
+                .extend(points.iter().flat_map(|tr| tr.observation.data.clone()));
+            all_continuous_actions_flat
+                .entry(model_id)
+                .or_insert(vec![])
+                .extend(points.iter().flat_map(|tr| tr.action.continuous.clone()));
+            all_discrete_actions_flat
+                .entry(model_id)
+                .or_insert(vec![])
+                .extend(points.iter().flat_map(|tr| tr.action.discrete.clone()));
+            all_log_probs
+                .entry(model_id)
+                .or_insert(vec![])
+                .extend(points.iter().map(|tr| tr.log_prob));
+            all_action_spaces.insert(model_id, env.action_space(*actor_id).clone());
         }
 
-        let adv_tensor = Tensor::from_floats(advantages.as_slice(), &self.device).reshape([len, 1]);
-        let ret_tensor = Tensor::from_floats(returns.as_slice(), &self.device).reshape([len, 1]);
+        // Convert arrays to tensors
+        let mut model_training_data = HashMap::new();
+        let model_ids = all_advantages.keys().cloned().collect::<HashSet<_>>();
+        for model_id in model_ids {
+            let size = all_advantages.get(&model_id).unwrap().len();
 
-        // Normalize Advantages (Critical for PPO stability)
-        let adv_mean = adv_tensor.clone().mean();
-        let adv_std = adv_tensor.clone().std(0) + 1e-8;
-        let adv_normalized = (adv_tensor - adv_mean) / adv_std;
+            let adv_tensor = Tensor::<B, 2>::from_floats(
+                all_advantages.get(&model_id).unwrap().as_slice(),
+                &self.device,
+            )
+            .reshape([size, 1]);
 
-        (adv_normalized, ret_tensor)
+            let adv_mean = adv_tensor.clone().mean().reshape([1, 1]);
+            let adv_std = adv_tensor.clone().var(0).sqrt().add_scalar(1e-8);
+            let adv_normalized = (adv_tensor - adv_mean) / adv_std;
+
+            let ret_tensor = Tensor::<B, 2>::from_floats(
+                all_returns.get(&model_id).unwrap().as_slice(),
+                &self.device,
+            )
+            .reshape([size, 1]);
+
+            let obs_len = all_observations_flat[&model_id].len();
+            let obs_dim = obs_len / size;
+            let obs_tensor = Tensor::<B, 2>::from_floats(
+                all_observations_flat.get(&model_id).unwrap().as_slice(),
+                &self.device,
+            )
+            .reshape([size, obs_dim]);
+
+            let continuous_act_len = all_continuous_actions_flat[&model_id].len();
+            let continuous_act_dim = continuous_act_len / size;
+            let continuous_actions_tensor = Tensor::<B, 2>::from_floats(
+                all_continuous_actions_flat
+                    .get(&model_id)
+                    .unwrap()
+                    .as_slice(),
+                &self.device,
+            )
+            .reshape([size, continuous_act_dim]);
+
+            let discrete_act_len = all_discrete_actions_flat[&model_id].len();
+            let discrete_act_dim = discrete_act_len / size;
+            let discrete_act_tensor = Tensor::<B, 2>::from_floats(
+                all_discrete_actions_flat.get(&model_id).unwrap().as_slice(),
+                &self.device,
+            )
+            .reshape([size, discrete_act_dim]);
+
+            let discrete_act_tensor = self.discrete_actions_to_one_hot_tensor(
+                discrete_act_tensor,
+                all_action_spaces.get(&model_id).unwrap(),
+            );
+
+            let log_probs_tensor = Tensor::<B, 2>::from_floats(
+                all_log_probs.get(&model_id).unwrap().as_slice(),
+                &self.device,
+            );
+
+            model_training_data.insert(
+                model_id,
+                TrainingData {
+                    obs: obs_tensor,
+                    discrete_actions: discrete_act_tensor,
+                    continuous_actions: continuous_actions_tensor,
+                    log_probs: log_probs_tensor,
+                    advantages: adv_normalized,
+                    returns: ret_tensor,
+                },
+            );
+        }
+
+        // TODO verify sizes of Tensors
+
+        // (adv_normalized, ret_tensor)
+        model_training_data
     }
 
     // -------------------------------------------------------------------------
@@ -374,20 +472,22 @@ where
 
     fn update_policy(
         &mut self,
-        buffer: RolloutBuffer,
+        trajectory: Trajectory,
         advantages: Tensor<B, 2>,
         returns: Tensor<B, 2>,
     ) {
         // 1. Create Full Batch Tensors
         // These are massive tensors containing (Steps * Actors) rows
-        let obs_tensor = Tensor::from_floats(buffer.obs.as_slice(), &self.device)
-            .reshape([buffer.obs.len() / buffer.obs_dim, buffer.obs_dim]);
+        let obs_tensor = Tensor::from_floats(trajectory.obs.as_slice(), &self.device).reshape([
+            trajectory.obs.len() / trajectory.obs_dim,
+            trajectory.obs_dim,
+        ]);
 
-        let acts_tensor = Tensor::from_floats(buffer.actions.as_slice(), &self.device)
-            .reshape([buffer.actions.len(), 1]);
+        let acts_tensor = Tensor::from_floats(trajectory.actions.as_slice(), &self.device)
+            .reshape([trajectory.actions.len(), 1]);
 
-        let old_log_probs = Tensor::from_floats(buffer.log_probs.as_slice(), &self.device)
-            .reshape([buffer.log_probs.len(), 1])
+        let old_log_probs = Tensor::from_floats(trajectory.log_probs.as_slice(), &self.device)
+            .reshape([trajectory.log_probs.len(), 1])
             .detach(); // Important: Detach old policies
 
         let advantages = advantages.detach();
@@ -471,5 +571,43 @@ where
             .convert::<f32>()
             .into_vec::<f32>()
             .unwrap()
+    }
+
+    fn discrete_actions_to_one_hot_tensor(
+        &self,
+        // Input: [Batch_Size, Num_Heads] (e.g., indices of selected actions)
+        tensor: Tensor<B, 2>,
+        // From ActionSpace.discrete: sizes of each head (e.g. [5, 2])
+        action_spaces: &ActionSpace,
+    ) -> Tensor<B, 2> {
+        // Output: [Batch_Size, Sum_Of_Limits]
+        let [batch_size, num_heads] = tensor.dims();
+        if num_heads != action_spaces.discrete.len() {
+            panic!(
+                "Discrete Action dimension is not correct. Tensor heads size should match to discrete action space size. Tensor heads: {}, Discrete Action Space: {}",
+                num_heads,
+                action_spaces.discrete.len()
+            );
+        }
+
+        let mut one_hot_parts = Vec::new();
+
+        for (head_idx, &class_count) in action_spaces.discrete.iter().enumerate() {
+            // Shape: [Batch_Size, 1]
+            let head_indices = tensor
+                .clone()
+                .slice([0..batch_size, head_idx..head_idx + 1]);
+
+            // [Batch_Size, 1, Class_Count]
+            let one_hot: Tensor<B, 3> = Tensor::<B, 2>::one_hot(head_indices, class_count);
+
+            // Squeeze the middle dimension to get [Batch_Size, Class_Count]
+            let one_hot_flat = one_hot.squeeze::<2>();
+            one_hot_parts.push(one_hot_flat);
+        }
+
+        // Concatenate all heads along dimension 1
+        // Result Shape: [Batch_Size, Sum(class_count)]
+        Tensor::cat(one_hot_parts, 1)
     }
 }

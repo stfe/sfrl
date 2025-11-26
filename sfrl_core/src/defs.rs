@@ -14,13 +14,14 @@ pub struct ActionSpace {
     pub continuous: Vec<(f32, f32)>, // TODO use structure to indicate which value is min and which one is max
 }
 
+#[derive(Clone, Debug)]
 pub struct Action {
     pub discrete: Vec<u32>,
     pub continuous: Vec<f32>,
 }
 
 pub struct StepResult {
-    pub observations: HashMap<ActorId, Observation>,
+    pub observations: HashMap<ActorId, Observation>, // next step observations
     pub rewards: HashMap<ActorId, f32>,
     pub terminated: HashMap<ActorId, bool>,
     pub truncated: HashMap<ActorId, bool>,
