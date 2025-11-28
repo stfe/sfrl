@@ -2,8 +2,10 @@ use crate::defs::{
     Action, ActionSpace, ActorId, Environment, Model, ModelId, ModelManager, Observation,
     StepResult,
 };
+use burn::module::AutodiffModule;
 use burn::nn::{Linear, LinearConfig, Relu};
-use burn::optim::Adam;
+use burn::optim::adaptor::OptimizerAdaptor;
+use burn::optim::{Adam, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::tensor::activation::{log_softmax, softmax};
 use burn::tensor::backend::AutodiffBackend;
@@ -13,7 +15,7 @@ use rand::rngs::ThreadRng;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
-#[derive(Config)]
+#[derive(Config, Debug)]
 pub struct PPOConfig {
     pub clip_ratio: f64,   // Usually 0.2
     pub gamma: f64,        // Discount factor (0.99)
@@ -21,8 +23,8 @@ pub struct PPOConfig {
     pub value_coef: f64,   // Weight for value loss (0.5)
     pub entropy_coef: f64, // Weight for entropy bonus (0.01)
     pub learning_rate: f64,
-    pub batch_size: usize,
-    pub max_steps: usize,
+    pub batch_size: usize, // TODO implement update policy only when batch size is accumulated
+    pub max_steps: usize,  // TODO restrict number of environment steps
     pub epochs_per_rollout: usize,
 }
 
@@ -34,8 +36,9 @@ struct PPOModelLogits<B: Backend> {
 }
 
 struct TrainingData<B: Backend> {
+    action_space: ActionSpace,
     obs: Tensor<B, 2>,
-    discrete_actions: Tensor<B, 2>,
+    discrete_actions: Tensor<B, 2, Int>,
     continuous_actions: Tensor<B, 2>,
     log_probs: Tensor<B, 2>,
     advantages: Tensor<B, 2>,
@@ -150,11 +153,11 @@ pub struct PPOTrainer<B, ModelType, Manager>
 where
     B: AutodiffBackend,
     ModelType: PPOModel<B>,
-    Manager: ModelManager<B, ModelType>,
+    Manager: ModelManager<B, ModelType> + AutodiffModule<B>,
 {
     config: PPOConfig,
     model_manager: Manager,
-    optimizer: Adam,
+    optimizer: OptimizerAdaptor<Adam, Manager, B>,
     device: B::Device,
     rng: ThreadRng,
     _phantom: PhantomData<ModelType>,
@@ -164,7 +167,7 @@ impl<B, ModelType, Manager> PPOTrainer<B, ModelType, Manager>
 where
     B: AutodiffBackend,
     ModelType: PPOModel<B>,
-    Manager: ModelManager<B, ModelType>,
+    Manager: ModelManager<B, ModelType> + AutodiffModule<B>,
 {
     /// Main entry point. Runs one full PPO iteration (Rollout -> GAE -> Update).
     pub fn train_step(&mut self, env: &mut dyn Environment) {
@@ -175,7 +178,7 @@ where
         let training_data = self.build_training_data(env, &trajectory);
 
         // 3. Policy & Value Update
-        self.update_policy(trajectory, advantages, returns);
+        self.update_policy(training_data);
     }
 
     fn collect_trajectory(&mut self, env: &mut dyn Environment) -> Trajectory {
@@ -334,9 +337,14 @@ where
         let mut all_continuous_actions_flat: HashMap<ModelId, Vec<f32>> = HashMap::new();
         let mut all_log_probs: HashMap<ModelId, Vec<f32>> = HashMap::new();
         let mut all_action_spaces: HashMap<ModelId, ActionSpace> = HashMap::new();
+        let mut model_id_to_action_space = HashMap::new();
 
         for (actor_id, points) in trajectory.paths.iter() {
             let model_id = env.model_id(*actor_id);
+            model_id_to_action_space
+                .entry(model_id)
+                .or_insert(env.action_space(*actor_id));
+
             let mut gae = 0.0;
             let mut next_value = 0.0; // Bootstrap value (0.0 if done)
 
@@ -431,16 +439,16 @@ where
 
             let discrete_act_len = all_discrete_actions_flat[&model_id].len();
             let discrete_act_dim = discrete_act_len / size;
-            let discrete_act_tensor = Tensor::<B, 2>::from_floats(
+            let discrete_act_tensor = Tensor::<B, 2, Int>::from_ints(
                 all_discrete_actions_flat.get(&model_id).unwrap().as_slice(),
                 &self.device,
             )
             .reshape([size, discrete_act_dim]);
 
-            let discrete_act_tensor = self.discrete_actions_to_one_hot_tensor(
-                discrete_act_tensor,
-                all_action_spaces.get(&model_id).unwrap(),
-            );
+            // let discrete_act_tensor = self.discrete_actions_to_one_hot_tensor(
+            //     discrete_act_tensor,
+            //     all_action_spaces.get(&model_id).unwrap(),
+            // );
 
             let log_probs_tensor = Tensor::<B, 2>::from_floats(
                 all_log_probs.get(&model_id).unwrap().as_slice(),
@@ -450,6 +458,7 @@ where
             model_training_data.insert(
                 model_id,
                 TrainingData {
+                    action_space: (**model_id_to_action_space.get(&model_id).unwrap()).clone(),
                     obs: obs_tensor,
                     discrete_actions: discrete_act_tensor,
                     continuous_actions: continuous_actions_tensor,
@@ -470,86 +479,193 @@ where
     // Phase 3: Optimization Update
     // -------------------------------------------------------------------------
 
-    fn update_policy(
-        &mut self,
-        trajectory: Trajectory,
-        advantages: Tensor<B, 2>,
-        returns: Tensor<B, 2>,
-    ) {
-        // 1. Create Full Batch Tensors
-        // These are massive tensors containing (Steps * Actors) rows
-        let obs_tensor = Tensor::from_floats(trajectory.obs.as_slice(), &self.device).reshape([
-            trajectory.obs.len() / trajectory.obs_dim,
-            trajectory.obs_dim,
-        ]);
+    fn update_policy(&mut self, training_data: HashMap<ModelId, TrainingData<B>>) {
+        for (
+            model_id,
+            TrainingData {
+                action_space,
+                obs,
+                discrete_actions,
+                continuous_actions,
+                log_probs,
+                advantages,
+                returns,
+            },
+        ) in training_data
+        {
+            for _ in 0..self.config.epochs_per_rollout {
+                // 1. Calculate the loss (Forward Pass)
+                let loss = self.compute_loss(
+                    model_id,
+                    action_space.clone(),
+                    obs.clone(),
+                    discrete_actions.clone(),
+                    continuous_actions.clone(),
+                    log_probs.clone(),
+                    advantages.clone(),
+                    returns.clone(),
+                );
 
-        let acts_tensor = Tensor::from_floats(trajectory.actions.as_slice(), &self.device)
-            .reshape([trajectory.actions.len(), 1]);
+                // 2. Calculate Gradients (Backward Pass)
+                // and returns the gradients for all parameters tracked in the graph.
+                let grads = loss.backward();
+                let grads_params = GradientsParams::from_grads(grads, &self.model_manager);
 
-        let old_log_probs = Tensor::from_floats(trajectory.log_probs.as_slice(), &self.device)
-            .reshape([trajectory.log_probs.len(), 1])
-            .detach(); // Important: Detach old policies
-
-        let advantages = advantages.detach();
-        let returns = returns.detach();
-
-        // 2. Epoch Loop
-        for _ in 0..self.config.epochs_per_rollout {
-            // In a real implementation, you would shuffle indices here and
-            // loop over mini-batches to save VRAM and improve convergence.
-            // For brevity, we do a full-batch update here.
-
-            let loss = self.compute_loss(
-                obs_tensor.clone(),
-                acts_tensor.clone(),
-                old_log_probs.clone(),
-                advantages.clone(),
-                returns.clone(),
-            );
-
-            let grads = Grads::from_loss(loss);
-            self.model_manager =
-                self.optimizer
-                    .step(self.config.learning_rate, self.model_manager, grads);
+                // TODO propagate gradients
+                // This works because Manager implements AutodiffModule<B>
+                self.model_manager = self.optimizer.step(
+                    self.config.learning_rate,
+                    self.model_manager.clone(),
+                    grads_params,
+                );
+            }
         }
     }
 
     fn compute_loss(
-        &self,
+        &mut self,
+        model_id: ModelId,
+        action_space: ActionSpace, // Unused for discrete slicing now, kept for signature compatibility
         obs: Tensor<B, 2>,
-        actions: Tensor<B, 2>,
+        discrete_actions: Tensor<B, 2, Int>,
+        continuous_actions: Tensor<B, 2>,
         old_log_probs: Tensor<B, 2>,
         advantages: Tensor<B, 2>,
         returns: Tensor<B, 2>,
     ) -> Tensor<B, 1> {
-        let (mean, log_std, values) = self.model_manager.forward_full(obs);
-        let std = log_std.exp();
+        // Check if we actually have continuous dimensions
+        let [batch_size, _] = obs.dims();
 
-        // 1. Calculate New Log Probs
-        let var = std.clone().powf(2.0);
-        let diff = actions - mean;
-        let new_log_probs =
-            diff.powf(2.0).neg().div(var.mul_scalar(2.0)) - std.clone().ln() - 0.9189385;
+        // 1. Get Model and Forward Pass
+        let model = self.model_manager.get_model_by_id(model_id);
+        let logits: PPOModelLogits<B> = model.forward(obs);
 
-        // 2. Ratio
+        // Initialize accumulators
+        let mut new_log_probs = Tensor::zeros([batch_size, 1], &self.device);
+        let mut total_entropy = Tensor::zeros([batch_size, 1], &self.device);
+
+        // =========================================================
+        // 2. Discrete Actions Handling (Iterate the Vec)
+        // =========================================================
+        Self::discrete_actions_loss_calc(
+            action_space.discrete,
+            discrete_actions,
+            batch_size,
+            &logits,
+            &mut new_log_probs,
+            &mut total_entropy,
+        );
+
+        // =========================================================
+        // 3. Continuous Actions Handling
+        // =========================================================
+        Self::continuous_actions_loss_calc(
+            continuous_actions,
+            &logits,
+            &mut new_log_probs,
+            &mut total_entropy,
+        );
+
+        // =========================================================
+        // 4. PPO Loss Calculation
+        // =========================================================
+
+        // Entropy Loss
+        let entropy_loss = total_entropy
+            .mean()
+            .mul_scalar(self.config.entropy_coef)
+            .neg();
+
+        // Ratio
         let ratio = (new_log_probs - old_log_probs).exp();
 
-        // 3. Surrogate Loss
+        // Surrogate Loss
         let surr1 = ratio.clone() * advantages.clone();
         let eps = self.config.clip_ratio;
         let ratio_clipped = ratio.clamp(1.0 - eps, 1.0 + eps);
         let surr2 = ratio_clipped * advantages;
         let policy_loss = Tensor::min_pair(surr1, surr2).mean().neg();
 
-        // 4. Value Loss
-        let value_loss = (values - returns).powf(2.0).mean();
-
-        // 5. Entropy Loss
-        let entropy = (std.ln() + 0.5 + 0.9189385).mean();
-        let entropy_loss = entropy.mul_scalar(self.config.entropy_coef).neg();
+        // Value Loss
+        let value_loss = (logits.values - returns).powf_scalar(2.0).mean();
 
         // Sum
         policy_loss + value_loss.mul_scalar(self.config.value_coef) + entropy_loss
+    }
+
+    fn continuous_actions_loss_calc(
+        continuous_actions: Tensor<B, 2>,
+        logits: &PPOModelLogits<B>,
+        new_log_probs: &mut Tensor<B, 2>,
+        total_entropy: &mut Tensor<B, 2>,
+    ) {
+        // 1. Check if continuous dimensions exist
+        if logits.continuous_mean.dims()[1] > 0 {
+            let mean = logits.continuous_mean.clone();
+
+            // We calculate std from log_std (neural networks usually output log_std for stability)
+            let std = logits.continuous_log_std.clone().exp();
+            let var = std.clone().powf_scalar(2.0);
+
+            // A. Gaussian Log Prob (Likelihood)
+            // Formula: -0.5 * ((x - mu)^2 / var) - log(std) - 0.5 * log(2pi)
+            let diff = continuous_actions - mean;
+
+            let log_std = logits.continuous_log_std.clone();
+
+            let gauss_log_probs =
+                diff.powf_scalar(2.0).neg().div(var.mul_scalar(2.0)) - log_std - 0.9189385; // 0.5 * ln(2 * pi)
+
+            // We sum_dim(1) because probability of a vector is the product of elements (sum in log-space).
+            *new_log_probs = new_log_probs.clone() + gauss_log_probs.sum_dim(1);
+
+            // B. Gaussian Entropy
+            // Formula: Sum(log(std) + 0.5 + 0.5 * log(2pi))
+            let gauss_entropy = (logits.continuous_log_std.clone() + 0.5 + 0.9189385).sum_dim(1);
+
+            // ERROR FIX: Dereference (*) to update accumulator
+            *total_entropy = total_entropy.clone() + gauss_entropy;
+        }
+    }
+
+    fn discrete_actions_loss_calc(
+        discrete_action_space: Vec<usize>,
+        discrete_actions: Tensor<B, 2, Int>, // Input is now explicitly Int
+        batch_size: usize,
+        logits: &PPOModelLogits<B>,
+        new_log_probs: &mut Tensor<B, 2>,
+        total_entropy: &mut Tensor<B, 2>,
+    ) {
+        // VALIDATION: Ensure model heads match the action space definition
+        assert_eq!(
+            logits.discrete.len(),
+            discrete_action_space.len(),
+            "Model discrete heads count does not match action space length"
+        );
+
+        // ZIP: Iterate through Logits and ActionSpace sizes together
+        for (head_idx, (head_logits, &space_size)) in logits
+            .discrete
+            .iter()
+            .zip(discrete_action_space.iter())
+            .enumerate()
+        {
+            let [_batch, dim] = head_logits.dims();
+            assert_eq!(dim, space_size, "Dimension mismatch in head {}", head_idx);
+
+            let head_log_probs_all = log_softmax(head_logits.clone(), 1);
+            let head_probs = softmax(head_logits.clone(), 1);
+            let action_col_indices = discrete_actions
+                .clone()
+                .slice([0..batch_size, head_idx..(head_idx + 1)]);
+
+            let selected_log_prob = head_log_probs_all.clone().gather(1, action_col_indices);
+
+            *new_log_probs = new_log_probs.clone() + selected_log_prob;
+
+            let head_entropy = (head_probs * head_log_probs_all).sum_dim(1).neg();
+            *total_entropy = total_entropy.clone() + head_entropy;
+        }
     }
 
     fn tensor_to_vec2d(tensor: Tensor<B, 2>) -> Vec<Vec<f32>> {

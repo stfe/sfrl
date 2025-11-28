@@ -1,7 +1,6 @@
 use rand::rngs::ThreadRng;
 use rand::Rng;
 use rand_distr::StandardNormal;
-use sfrl_core::utils::softmax;
 use sfrl_core::{Action, Actions, ActorId, Env, Observation, StepResult, StepResults};
 use sfrl_engines::tictactoe::{Mark, TicTacToe};
 
